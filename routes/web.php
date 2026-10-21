@@ -1,9 +1,12 @@
 <?php
 
 use App\Http\Controllers\AccountController;
+use App\Http\Controllers\AccountInvoiceController;
+use App\Http\Controllers\AccountOrderController;
 use App\Http\Controllers\Admin\AdminCategoryController;
 use App\Http\Controllers\Admin\AdminCourseController;
 use App\Http\Controllers\Admin\AdminDashboardController;
+use App\Http\Controllers\Admin\AdminInvoiceController;
 use App\Http\Controllers\Admin\AdminOrderController;
 use App\Http\Controllers\Admin\AdminReportController;
 use App\Http\Controllers\Admin\AdminServiceController;
@@ -83,6 +86,16 @@ Route::middleware(['auth', 'role:super_admin,operator'])
         Route::get('/pesanan/{order}', [AdminOrderController::class, 'show'])->name('orders.show');
         Route::patch('/pesanan/{order}/status', [AdminOrderController::class, 'updateStatus'])->name('orders.status');
 
+        // Tagihan murid: super admin + operator
+        Route::get('/tagihan', [AdminInvoiceController::class, 'index'])->name('invoices.index');
+        Route::get('/tagihan/baru', [AdminInvoiceController::class, 'create'])->name('invoices.create');
+        Route::post('/tagihan', [AdminInvoiceController::class, 'store'])->name('invoices.store');
+        Route::get('/tagihan/{invoice}', [AdminInvoiceController::class, 'show'])->name('invoices.show');
+        Route::get('/tagihan/{invoice}/edit', [AdminInvoiceController::class, 'edit'])->name('invoices.edit');
+        Route::put('/tagihan/{invoice}', [AdminInvoiceController::class, 'update'])->name('invoices.update');
+        Route::patch('/tagihan/{invoice}/status', [AdminInvoiceController::class, 'updateStatus'])->name('invoices.status');
+        Route::delete('/tagihan/{invoice}', [AdminInvoiceController::class, 'destroy'])->name('invoices.destroy');
+
         // Laporan keuangan: super admin + operator
         Route::get('/laporan', [AdminReportController::class, 'index'])->name('reports.index');
         Route::get('/laporan/ekspor', [AdminReportController::class, 'export'])->name('reports.export');
@@ -115,4 +128,18 @@ Route::middleware(['auth', 'role:murid'])
     ->name('account.')
     ->group(function () {
         Route::get('/', [AccountController::class, 'dashboard'])->name('dashboard');
+
+        // Tagihan murid
+        Route::get('/tagihan', [AccountInvoiceController::class, 'index'])->name('invoices.index');
+        Route::get('/tagihan/{invoice}', [AccountInvoiceController::class, 'show'])->name('invoices.show');
+        Route::post('/tagihan/{invoice}/bayar', [AccountInvoiceController::class, 'pay'])->name('invoices.pay');
+
+        // Pesanan & profil
+        Route::get('/pesanan', [AccountOrderController::class, 'index'])->name('orders.index');
+        Route::get('/pesanan/{orderNumber}', [AccountOrderController::class, 'show'])->name('orders.show');
+        Route::get('/profil', [AccountController::class, 'profile'])->name('profile');
+        Route::put('/profil', [AccountController::class, 'updateProfile'])->name('profile.update');
     });
+
+/* Callback Snap untuk tagihan (di luar guard murid agar aman saat redirect). */
+Route::get('/pembayaran/tagihan/selesai', [AccountInvoiceController::class, 'finish'])->name('account.invoices.finish');

@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Models\Invoice;
 use App\Models\Order;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
@@ -14,6 +15,32 @@ class MidtransService
     public function isConfigured(): bool
     {
         return filled(config('midtrans.server_key'));
+    }
+
+    /**
+     * Bangun order_id Midtrans yang unik untuk sebuah transaksi.
+     *
+     * Midtrans hanya mengizinkan satu order_id dipakai sekali. Bila murid
+     * membatalkan lalu membayar ulang (atau token lama kedaluwarsa), order_id
+     * yang sama akan ditolak ("order_id sudah digunakan"). Karena itu kita
+     * menambahkan suffix percobaan unik di belakang nomor resmi.
+     *
+     * Format: "INV-XXXX~<uniqid>" / "FRC-XXXX~<uniqid>". Simbol "~" dipakai
+     * sebagai pemisah karena Midtrans mengizinkan huruf, angka, dan - _ : .
+     * (tidak mengizinkan spasi).
+     */
+    public function buildUniqueOrderId(string $baseOrderId): string
+    {
+        return $baseOrderId.'~'.strtoupper(bin2hex(random_bytes(4)));
+    }
+
+    /**
+     * Ambil kembali nomor resmi (invoice/order) dari order_id Midtrans yang
+     * mungkin memiliki suffix percobaan.
+     */
+    public function baseOrderId(string $midtransOrderId): string
+    {
+        return explode('~', $midtransOrderId, 2)[0];
     }
 
     /**
@@ -31,9 +58,11 @@ class MidtransService
             return null;
         }
 
+        $midtransOrderId = $this->buildUniqueOrderId($order->order_number);
+
         $payload = [
             'transaction_details' => [
-                'order_id' => $order->order_number,
+                'order_id' => $midtransOrderId,
                 'gross_amount' => (int) $order->total,
             ],
             'customer_details' => [
@@ -79,10 +108,91 @@ class MidtransService
             return [
                 'token' => $response->json('token'),
                 'redirect_url' => $response->json('redirect_url'),
+                'order_id' => $midtransOrderId,
             ];
         } catch (\Throwable $e) {
             Log::error('Midtrans Snap exception: '.$e->getMessage(), [
                 'order' => $order->order_number,
+            ]);
+
+            return null;
+        }
+    }
+
+    /**
+     * Buat transaksi Snap untuk sebuah tagihan (invoice) murid.
+     *
+     * @return array{token: string, redirect_url: string|null}|null
+     */
+    public function createSnapTokenForInvoice(Invoice $invoice): ?array
+    {
+        if (! $this->isConfigured()) {
+            Log::warning('Midtrans: server key belum diisi, tagihan dilewati.', [
+                'invoice' => $invoice->invoice_number,
+            ]);
+
+            return null;
+        }
+
+        $invoice->loadMissing('user');
+
+        $midtransOrderId = $this->buildUniqueOrderId($invoice->invoice_number);
+
+        $payload = [
+            'transaction_details' => [
+                'order_id' => $midtransOrderId,
+                'gross_amount' => (int) $invoice->amount,
+            ],
+            'customer_details' => [
+                'first_name' => $invoice->user?->name ?? 'Murid',
+                'email' => $invoice->user?->email,
+                'phone' => $invoice->user?->phone,
+            ],
+            'item_details' => [[
+                'id' => $invoice->invoice_number,
+                'price' => (int) $invoice->amount,
+                'quantity' => 1,
+                'name' => mb_substr($invoice->title, 0, 50),
+            ]],
+            'expiry' => [
+                'unit' => 'minutes',
+                'duration' => config('midtrans.expiry_minutes', 1440),
+            ],
+        ];
+
+        $enabled = config('midtrans.enabled_payments', []);
+        if (! empty($enabled)) {
+            $payload['enabled_payments'] = array_values($enabled);
+        }
+
+        if (config('midtrans.notification_url')) {
+            $payload['callbacks'] = ['finish' => route('account.invoices.finish')];
+        }
+
+        try {
+            $response = Http::withBasicAuth(config('midtrans.server_key'), '')
+                ->acceptJson()
+                ->timeout(15)
+                ->post(config('midtrans.snap_url'), $payload);
+
+            if ($response->failed()) {
+                Log::error('Midtrans Snap tagihan gagal.', [
+                    'invoice' => $invoice->invoice_number,
+                    'status' => $response->status(),
+                    'body' => $response->json() ?? $response->body(),
+                ]);
+
+                return null;
+            }
+
+            return [
+                'token' => $response->json('token'),
+                'redirect_url' => $response->json('redirect_url'),
+                'order_id' => $midtransOrderId,
+            ];
+        } catch (\Throwable $e) {
+            Log::error('Midtrans Snap tagihan exception: '.$e->getMessage(), [
+                'invoice' => $invoice->invoice_number,
             ]);
 
             return null;
@@ -136,6 +246,54 @@ class MidtransService
             'refund', 'partial_refund' => 'dibatalkan',
             default => null,
         };
+    }
+
+    /**
+     * Cocokkan status Midtrans ke status tagihan (invoice) internal.
+     */
+    public function mapInvoiceStatus(string $transactionStatus, ?string $fraudStatus = null): ?string
+    {
+        return match ($transactionStatus) {
+            'capture' => $fraudStatus === 'challenge' ? null : Invoice::STATUS_DIBAYAR,
+            'settlement' => Invoice::STATUS_DIBAYAR,
+            'pending' => Invoice::STATUS_BELUM_DIBAYAR,
+            'deny', 'cancel', 'expire', 'failure' => Invoice::STATUS_DIBATALKAN,
+            'refund', 'partial_refund' => Invoice::STATUS_DIBATALKAN,
+            default => null,
+        };
+    }
+
+    /**
+     * Ambil status transaksi terkini dari Midtrans untuk sebuah tagihan dan
+     * kembalikan bila transaksi sudah lunas.
+     *
+     * Dipakai sebagai jaring pengaman otomatis: bila webhook tidak sampai
+     * (mis. server tidak dapat diakses publik), status tetap bisa ditarik saat
+     * halaman dibuka sehingga tidak perlu konfirmasi manual.
+     *
+     * @return array<string, mixed>|null
+     */
+    public function fetchInvoiceStatus(Invoice $invoice): ?array
+    {
+        if (! $invoice->midtrans_order_id) {
+            return null;
+        }
+
+        return $this->transactionStatus($invoice->midtrans_order_id);
+    }
+
+    /**
+     * Ambil status transaksi terkini dari Midtrans untuk sebuah pesanan.
+     *
+     * @return array<string, mixed>|null
+     */
+    public function fetchOrderStatus(Order $order): ?array
+    {
+        if (! $order->midtrans_order_id) {
+            return null;
+        }
+
+        return $this->transactionStatus($order->midtrans_order_id);
     }
 
     /**

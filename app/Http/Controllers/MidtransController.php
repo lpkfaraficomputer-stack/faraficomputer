@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\Invoice;
 use App\Models\Order;
 use App\Services\MidtransService;
 use Illuminate\Http\JsonResponse;
@@ -48,7 +49,7 @@ class MidtransController extends Controller
 
             $order->update([
                 'payment_provider' => 'midtrans',
-                'midtrans_order_id' => $order->order_number,
+                'midtrans_order_id' => $snap['order_id'] ?? $order->order_number,
                 'midtrans_snap_token' => $snap['token'],
             ]);
         }
@@ -65,9 +66,17 @@ class MidtransController extends Controller
      */
     public function finish(Request $request)
     {
-        $orderNumber = $request->query('order_id') ?? $request->query('order_number');
+        $orderId = $request->query('order_id') ?? $request->query('order_number');
+        $baseOrderId = $orderId ? $this->midtrans->baseOrderId($orderId) : null;
 
-        if ($orderNumber && $order = Order::where('order_number', $orderNumber)->first()) {
+        $order = null;
+        if ($baseOrderId) {
+            $order = Order::where('order_number', $baseOrderId)
+                ->orWhere('midtrans_order_id', $orderId)
+                ->first();
+        }
+
+        if ($order) {
             // Segarkan status langsung dari Midtrans (jaga-jaga bila webhook belum tiba).
             $this->syncFromMidtrans($order);
 
@@ -86,15 +95,18 @@ class MidtransController extends Controller
 
         Log::info('Midtrans notification diterima.', $payload);
 
-        $orderNumber = $payload['order_id'] ?? null;
-        $order = $orderNumber ? Order::where('order_number', $orderNumber)->first() : null;
+        $midtransOrderId = $payload['order_id'] ?? null;
+        $baseOrderId = $midtransOrderId ? $this->midtrans->baseOrderId($midtransOrderId) : null;
+
+        $order = $baseOrderId ? Order::where('order_number', $baseOrderId)->first() : null;
 
         if (! $order) {
-            return response()->json(['message' => 'Pesanan tidak ditemukan.'], 404);
+            // Bisa jadi ini notifikasi untuk tagihan (invoice) murid.
+            return $this->notificationInvoice($midtransOrderId, $baseOrderId, $payload);
         }
 
-        // Jangan percaya payload mentah — verifikasi ke API Midtrans.
-        $status = $this->midtrans->transactionStatus($orderNumber);
+        // Jangan percaya payload mentah — verifikasi ke API Midtrans (pakai order_id lengkap).
+        $status = $this->midtrans->transactionStatus($midtransOrderId);
 
         if (! $status) {
             return response()->json(['message' => 'Gagal verifikasi status.'], 502);
@@ -112,7 +124,50 @@ class MidtransController extends Controller
             return response()->json(['message' => 'Nominal tidak cocok.'], 422);
         }
 
-        $this->applyStatus($order, $status);
+        // Simpan order_id unik agar sinkronisasi lanjutan memakai ID yang benar.
+        $this->applyStatus($order, $status, $midtransOrderId);
+
+        return response()->json(['message' => 'OK']);
+    }
+
+    /**
+     * Tangani notifikasi Midtrans untuk tagihan (invoice) murid.
+     *
+     * @param  array<string, mixed>  $payload
+     */
+    private function notificationInvoice(?string $midtransOrderId, ?string $baseOrderId, array $payload): JsonResponse
+    {
+        if (! $baseOrderId) {
+            return response()->json(['message' => 'order_id kosong.'], 422);
+        }
+
+        $invoice = Invoice::where('invoice_number', $baseOrderId)->first();
+
+        if (! $invoice) {
+            return response()->json(['message' => 'Pesanan/tagihan tidak ditemukan.'], 404);
+        }
+
+        $status = $this->midtrans->transactionStatus($midtransOrderId);
+
+        if (! $status) {
+            return response()->json(['message' => 'Gagal verifikasi status.'], 502);
+        }
+
+        $gross = (int) ($status['gross_amount'] ?? 0);
+        if ($gross > 0 && $gross !== (int) $invoice->amount) {
+            Log::warning('Midtrans nominal tagihan tidak cocok.', [
+                'invoice' => $invoice->invoice_number,
+                'expected' => $invoice->amount,
+                'received' => $gross,
+            ]);
+
+            return response()->json(['message' => 'Nominal tidak cocok.'], 422);
+        }
+
+        // Simpan order_id unik agar sinkronisasi lanjutan memakai ID yang benar.
+        $invoice->midtrans_order_id = $midtransOrderId;
+
+        app(AccountInvoiceController::class)->applyStatus($invoice, $status);
 
         return response()->json(['message' => 'OK']);
     }
@@ -122,11 +177,11 @@ class MidtransController extends Controller
      */
     private function syncFromMidtrans(Order $order): void
     {
-        if (! $order->midtrans_order_id || ! $this->midtrans->isConfigured()) {
+        if (! $this->midtrans->isConfigured()) {
             return;
         }
 
-        if ($status = $this->midtrans->transactionStatus($order->midtrans_order_id)) {
+        if ($status = $this->midtrans->fetchOrderStatus($order)) {
             $this->applyStatus($order, $status);
         }
     }
@@ -134,11 +189,17 @@ class MidtransController extends Controller
     /**
      * @param  array<string, mixed>  $status
      */
-    private function applyStatus(Order $order, array $status): void
+    public function applyStatus(Order $order, array $status, ?string $midtransOrderId = null): void
     {
         $transactionStatus = $status['transaction_status'] ?? '';
         $fraudStatus = $status['fraud_status'] ?? null;
         $mapped = $this->midtrans->mapOrderStatus($transactionStatus, $fraudStatus);
+
+        // Sekali lunas, status tidak boleh turun kembali (mis. notifikasi lama).
+        // 'selesai' juga dianggap sudah lunas sehingga tidak diturunkan.
+        if (in_array($order->status, ['dibayar', 'selesai'], true) && $mapped !== 'dibayar') {
+            return;
+        }
 
         $updates = [
             'payment_type' => $status['payment_type'] ?? $order->payment_type,
@@ -146,6 +207,10 @@ class MidtransController extends Controller
             'midtrans_transaction_id' => $status['transaction_id'] ?? $order->midtrans_transaction_id,
             'payment_payload' => $status,
         ];
+
+        if ($midtransOrderId) {
+            $updates['midtrans_order_id'] = $midtransOrderId;
+        }
 
         if ($mapped === 'dibayar' && ! $order->paid_at) {
             $updates['paid_at'] = now();

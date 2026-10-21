@@ -33,6 +33,11 @@
                 @php($pending = \App\Models\Order::where('status', 'menunggu_pembayaran')->count())
                 @if($pending > 0)<span class="admin-nav-badge">{{ $pending }}</span>@endif
             </a>
+            <a href="{{ route('admin.invoices.index') }}" class="{{ request()->routeIs('admin.invoices.*') ? 'active' : '' }}">
+                <span class="admin-nav-ico">📄</span> <span>Tagihan Murid</span>
+                @php($tagihanBaru = \App\Models\Invoice::where('status', \App\Models\Invoice::STATUS_BELUM_DIBAYAR)->count())
+                @if($tagihanBaru > 0)<span class="admin-nav-badge">{{ $tagihanBaru }}</span>@endif
+            </a>
             <a href="{{ route('admin.services.index') }}" class="{{ request()->routeIs('admin.services.*') ? 'active' : '' }}">
                 <span class="admin-nav-ico">🧰</span> <span>Layanan</span>
                 @php($layananBaru = \App\Models\ServiceRequest::where('status', 'baru')->count())

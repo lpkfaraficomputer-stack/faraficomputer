@@ -250,6 +250,16 @@
 .status-selesai { background: #d1fae5; color: #047857; }
 .status-dibatalkan { background: #fee2e2; color: #b91c1c; }
 
+/* ---------- Tagihan (invoice) ---------- */
+.status-belum_dibayar { background: #fef3c7; color: #b45309; }
+.text-danger { color: #dc2626; font-weight: 600; }
+
+.pay-panel { padding: 1.6rem 1.35rem 1.8rem; text-align: center; }
+.pay-panel .pay-illustration { font-size: 3rem; margin-bottom: .6rem; }
+.pay-panel h3 { font-size: 1.05rem; letter-spacing: -.015em; margin-bottom: .4rem; }
+.pay-panel p { font-size: .87rem; margin-bottom: 1.2rem; }
+.pay-panel .btn-block { margin-bottom: .9rem; }
+
 /* ---------- Forms admin ---------- */
 .form-group-full { grid-column: 1 / -1; }
 .form-actions {
